@@ -122,6 +122,11 @@ const navItems = computed<NavItem[]>(() => [
     icon: 'i-mdi-chart-line',
   },
   {
+    label: 'Gold',
+    to: '/gold',
+    icon: 'i-mdi-gold',
+  },
+  {
     label: 'Logs',
     to: '/logs',
     icon: 'i-mdi-format-list-bulleted',
