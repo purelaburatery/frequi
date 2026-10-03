@@ -4,8 +4,8 @@ import { CandlestickChart } from 'echarts/charts';
 import { DataZoomComponent, GridComponent, TooltipComponent } from 'echarts/components';
 import { use } from 'echarts/core';
 import { CanvasRenderer } from 'echarts/renderers';
-import axios from 'axios';
 import { computed, onMounted, onUnmounted, ref } from 'vue';
+import { useBotStore } from '@/stores/ftbotwrapper';
 import { useColorStore } from '@/stores/colors';
 import { useSettingsStore } from '@/stores/settings';
 
@@ -64,10 +64,9 @@ interface MarketState {
   trading_enabled: boolean;
 }
 
-// Live XAUUSD comes from MT5 via freqtrade's own API server, so this is same-origin.
-const ENDPOINT = '/api/v1/gold/candles';
-const STATE_ENDPOINT = '/api/v1/gold/market_state';
-const DECISION_ENDPOINT = '/api/v1/gold/decision';
+// These three routes sit behind auth_dependency (mount.py:42-55), so they are fetched
+// through the bot store's named actions, which use FreqUI's authenticated client. The URLs
+// live in the store; the component never builds a request itself.
 const REFRESH_MS = 5000;
 // The engine's answer only moves when a candle closes, and the server caches it for 20s,
 // so polling faster than that would just re-fetch an identical response.
@@ -77,6 +76,47 @@ const PRIMARY_TF = '1h';
 
 const colorStore = useColorStore();
 const settingsStore = useSettingsStore();
+const botStore = useBotStore();
+
+// WHICH BOT. The Gold routes are served by THIS freqtrade instance, so the token has to
+// belong to a bot pointed at this same origin. A bot registered against another host holds
+// a token this server will not accept, and that 401 would read as a server fault rather
+// than a configuration one.
+//
+// `botUrl` is what was typed when the bot was registered - BotLogin defaults it to
+// window.location.origin, so the ordinary case matches exactly. Empty means same-origin too.
+const sameOriginBot = computed<boolean>(() => {
+  const url = botStore.selectedBotObj?.botUrl;
+  if (!url) {
+    return true;
+  }
+  return url.replace(/\/+$/, '') === window.location.origin.replace(/\/+$/, '');
+});
+
+/** Why a request could not even be attempted, or '' if it can. */
+const blocked = computed<string>(() => {
+  if (!botStore.hasBots) {
+    return 'No bot is registered. Log in to a bot on this server to view the Gold chart.';
+  }
+  if (!botStore.selectedBot) {
+    return 'No bot selected. Choose a bot on this server to view the Gold chart.';
+  }
+  if (!sameOriginBot.value) {
+    return 'The selected bot points at a different server, so its login cannot authorise '
+      + 'these routes. Select a bot running on this server.';
+  }
+  return '';
+});
+
+/** Turn a failed request into something a reader can act on. */
+function describe(e: unknown): string {
+  const status =
+    (e as { status?: number })?.status ?? (e as { response?: { status?: number } })?.response?.status;
+  if (status === 401 || status === 403) {
+    return 'Not authorised (401). The bot session has expired - log in to it again.';
+  }
+  return e instanceof Error ? e.message : String(e);
+}
 
 const candles = ref<Candle[]>([]);
 const error = ref<string>('');
@@ -84,14 +124,18 @@ const loading = ref(true);
 let timer: ReturnType<typeof setInterval> | undefined;
 
 async function fetchCandles() {
+  if (blocked.value) {
+    error.value = blocked.value;
+    loading.value = false;
+    return;
+  }
   try {
-    const { data } = await axios.get<Candle[]>(ENDPOINT, { params: { count: CANDLE_COUNT } });
-    candles.value = data;
+    candles.value = (await botStore.activeBot.getGoldCandles(CANDLE_COUNT)) as Candle[];
     error.value = '';
   } catch (e) {
     // Usually means the MT5 terminal isn't running or isn't logged in - surface it
     // rather than showing an empty chart that looks like "no movement".
-    error.value = e instanceof Error ? e.message : String(e);
+    error.value = describe(e);
   } finally {
     loading.value = false;
   }
@@ -104,18 +148,25 @@ let stateTimer: ReturnType<typeof setInterval> | undefined;
 const decision = ref<DecisionState | null>(null);
 
 async function fetchState() {
+  if (blocked.value) {
+    stateError.value = blocked.value;
+    return;
+  }
   try {
     // The decision endpoint returns the market state's verdict, so both come from one
     // pass and cannot disagree about which candle they describe.
     const [stateRes, decisionRes] = await Promise.all([
-      axios.get<MarketState>(STATE_ENDPOINT),
-      axios.get<DecisionState>(DECISION_ENDPOINT),
+      botStore.activeBot.getGoldMarketState(),
+      botStore.activeBot.getGoldDecision(),
     ]);
-    state.value = stateRes.data;
-    decision.value = decisionRes.data;
+    state.value = stateRes as MarketState;
+    decision.value = decisionRes as DecisionState;
     stateError.value = '';
   } catch (e) {
-    stateError.value = e instanceof Error ? e.message : String(e);
+    // A stale panel next to a 401 reads as current. Clear it, then show why.
+    state.value = null;
+    decision.value = null;
+    stateError.value = describe(e);
   }
 }
 
@@ -225,7 +276,14 @@ const chartOptions = computed(() => ({
         class="border dark:border-neutral-700 border-neutral-300 rounded-md p-3 text-sm"
       >
         Could not load gold candles: {{ error }}
-        <div class="text-neutral-500 mt-1">
+        <div v-if="blocked" class="text-neutral-500 mt-1">
+          These routes require a bot login on this server. The chart stays blank rather than
+          showing an empty candle series, because an empty series reads as a flat market.
+        </div>
+        <div v-else-if="error.startsWith('Not authorised')" class="text-neutral-500 mt-1">
+          Log in to the bot again from the Bots page, then reload.
+        </div>
+        <div v-else class="text-neutral-500 mt-1">
           Check that the MT5 terminal is running and logged into a trade account.
         </div>
       </div>

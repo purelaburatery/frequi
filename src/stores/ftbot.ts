@@ -1447,8 +1447,27 @@ export function createBotSubStore(botId: string, botName: string) {
     }
     // #endregion websocket handling
 
+    // #region gold
+    // Served by this same freqtrade instance at /api/v1/gold/*, behind auth_dependency.
+    // `api` already carries the bearer token and this bot's baseUrl, which ends in /api/v1.
+    // Returned as unknown on purpose: the shapes are declared in GoldChart.vue, which is
+    // our file. Importing them here would mean patching a second upstream anchor.
+    async function getGoldCandles(count: number) {
+      return api<unknown[]>('/gold/candles', { query: { count } });
+    }
+    async function getGoldMarketState() {
+      return api<unknown>('/gold/market_state');
+    }
+    async function getGoldDecision() {
+      return api<unknown>('/gold/decision');
+    }
+    // #endregion gold
+
     return {
       websocketStarted,
+      getGoldCandles,
+      getGoldMarketState,
+      getGoldDecision,
       isSelected,
       ping,
       botStatusAvailable,
