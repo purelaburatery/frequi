@@ -29,6 +29,7 @@
     "echarts": "^6.1.0",
     "favico.js": "^0.3.10",
     "humanize-duration": "^3.34.1",
+    "lightweight-charts": "^5.2.1",
     "ofetch": "^1.5.1",
     "pinia": "4.0.3",
     "pinia-plugin-persistedstate": "^4.7.1",

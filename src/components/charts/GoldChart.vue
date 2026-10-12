@@ -1,22 +1,34 @@
 <script setup lang="ts">
-import ECharts from 'vue-echarts';
-import { CandlestickChart } from 'echarts/charts';
-import { DataZoomComponent, GridComponent, TooltipComponent } from 'echarts/components';
-import { use } from 'echarts/core';
-import { CanvasRenderer } from 'echarts/renderers';
-import { computed, onMounted, onUnmounted, ref } from 'vue';
+// The chart draws; the bot decides. Candles and every overlay come from the bot's own
+// /api/v1/gold/observations: MT5 candles plus the backend detectors' output
+// (app/market/chart_observations.py). Lightweight Charts by TradingView is the renderer only -
+// it receives observations, it never computes one.
+import {
+  CandlestickSeries,
+  createChart,
+  createSeriesMarkers,
+  type IChartApi,
+  type ISeriesApi,
+  type ISeriesMarkersPluginApi,
+  type MouseEventParams,
+  type Time,
+} from 'lightweight-charts';
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue';
 import { useBotStore } from '@/stores/ftbotwrapper';
 import { useColorStore } from '@/stores/colors';
 import { useSettingsStore } from '@/stores/settings';
-
-use([CandlestickChart, GridComponent, TooltipComponent, DataZoomComponent, CanvasRenderer]);
-
-interface Candle {
-  open: number;
-  high: number;
-  low: number;
-  close: number;
-}
+import {
+  CATEGORIES,
+  DEFAULT_ENABLED,
+  ZonesPrimitive,
+  toMarkers,
+  toZones,
+  uncategorised,
+  zoneAt,
+  type Observation,
+  type Snapshot,
+  type Zone,
+} from './goldOverlays';
 
 interface TimeframeState {
   available: boolean;
@@ -64,14 +76,14 @@ interface MarketState {
   trading_enabled: boolean;
 }
 
-// These three routes sit behind auth_dependency (mount.py:42-55), so they are fetched
-// through the bot store's named actions, which use FreqUI's authenticated client. The URLs
-// live in the store; the component never builds a request itself.
-const REFRESH_MS = 5000;
+// The Gold routes sit behind auth_dependency (mount.py), so they are fetched through the bot
+// store's named actions, which use FreqUI's authenticated client. The component never builds
+// a request itself.
+const REFRESH_MS = 15000;
 // The engine's answer only moves when a candle closes, and the server caches it for 20s,
 // so polling faster than that would just re-fetch an identical response.
 const STATE_REFRESH_MS = 20000;
-const CANDLE_COUNT = 200;
+const TIMEFRAMES = ['15m', '1h', '4h', '1d'];
 const PRIMARY_TF = '1h';
 
 const colorStore = useColorStore();
@@ -79,11 +91,7 @@ const settingsStore = useSettingsStore();
 const botStore = useBotStore();
 
 // WHICH BOT. The Gold routes are served by THIS freqtrade instance, so the token has to
-// belong to a bot pointed at this same origin. A bot registered against another host holds
-// a token this server will not accept, and that 401 would read as a server fault rather
-// than a configuration one.
-//
-// `botUrl` is what was typed when the bot was registered - BotLogin defaults it to
+// belong to a bot pointed at this same origin. BotLogin defaults the URL to
 // window.location.origin, so the ordinary case matches exactly. Empty means same-origin too.
 const sameOriginBot = computed<boolean>(() => {
   const url = botStore.selectedBotObj?.botUrl;
@@ -118,28 +126,118 @@ function describe(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
 
-const candles = ref<Candle[]>([]);
+// ------------------------------------------------------------------------- the chart
+
+const snapshot = ref<Snapshot | null>(null);
+const timeframe = ref('15m');
+const enabled = ref<Record<string, boolean>>({ ...DEFAULT_ENABLED });
+const selected = ref<Observation | null>(null);
 const error = ref<string>('');
 const loading = ref(true);
 let timer: ReturnType<typeof setInterval> | undefined;
 
-async function fetchCandles() {
+const chartEl = ref<HTMLElement | null>(null);
+let chart: IChartApi | null = null;
+let series: ISeriesApi<'Candlestick'> | null = null;
+let markers: ISeriesMarkersPluginApi<Time> | null = null;
+const zonesPrimitive = new ZonesPrimitive();
+let drawnZones: Zone[] = [];
+
+function buildChart() {
+  if (!chartEl.value || chart) return;
+  const dark = settingsStore.chartTheme === 'dark';
+  chart = createChart(chartEl.value, {
+    autoSize: true,
+    layout: {
+      background: { color: 'transparent' },
+      textColor: dark ? '#d1d4dc' : '#191919',
+      attributionLogo: true, // Lightweight Charts licence: attribution to TradingView
+    },
+    grid: {
+      vertLines: { color: dark ? '#2a2e39' : '#eceff1' },
+      horzLines: { color: dark ? '#2a2e39' : '#eceff1' },
+    },
+    timeScale: { timeVisible: true, secondsVisible: false },
+  });
+  series = chart.addSeries(CandlestickSeries, {
+    upColor: colorStore.colorUp,
+    downColor: colorStore.colorDown,
+    wickUpColor: colorStore.colorUp,
+    wickDownColor: colorStore.colorDown,
+    borderVisible: false,
+  });
+  markers = createSeriesMarkers(series, []);
+  series.attachPrimitive(zonesPrimitive);
+  chart.subscribeClick(onChartClick);
+}
+
+/** Replace everything drawn - never append - so a refresh cannot duplicate a drawing. */
+function render(fit = false) {
+  const s = snapshot.value;
+  if (!s || !series || !markers) return;
+  series.setData(
+    s.candles.map((c) => ({ time: c.time as Time, open: c.open, high: c.high, low: c.low, close: c.close })),
+  );
+  const lastTime = s.candles.at(-1)?.time ?? 0;
+  markers.setMarkers(toMarkers(s.observations, enabled.value));
+  drawnZones = toZones(s.observations, enabled.value, lastTime);
+  zonesPrimitive.setZones(drawnZones);
+  if (fit) chart?.timeScale().fitContent();
+}
+
+function onChartClick(param: MouseEventParams<Time>) {
+  const obs = snapshot.value?.observations ?? [];
+  if (param.hoveredObjectId) {
+    selected.value = obs.find((o) => o.observation_id === param.hoveredObjectId) ?? null;
+    return;
+  }
+  if (!param.point || param.time === undefined || !series) return;
+  const price = series.coordinateToPrice(param.point.y);
+  if (price === null) return;
+  const zone = zoneAt(drawnZones, param.time as number, price);
+  selected.value = zone ? (obs.find((o) => o.observation_id === zone.id) ?? null) : null;
+}
+
+async function fetchObservations(fit = false) {
   if (blocked.value) {
     error.value = blocked.value;
     loading.value = false;
     return;
   }
   try {
-    candles.value = (await botStore.activeBot.getGoldCandles(CANDLE_COUNT)) as Candle[];
+    snapshot.value = (await botStore.activeBot.getGoldObservations(timeframe.value)) as Snapshot;
     error.value = '';
+    loading.value = false;
+    await nextTick();
+    buildChart();
+    render(fit);
   } catch (e) {
-    // Usually means the MT5 terminal isn't running or isn't logged in - surface it
-    // rather than showing an empty chart that looks like "no movement".
+    // Usually the MT5 terminal is not running or not logged in. Say so, and drop the old
+    // drawings: a stale chart next to an error reads as current.
+    snapshot.value = null;
     error.value = describe(e);
-  } finally {
     loading.value = false;
   }
 }
+
+watch(timeframe, () => {
+  selected.value = null;
+  fetchObservations(true);
+});
+watch(enabled, () => render(), { deep: true });
+
+const unknownTypes = computed(() => uncategorised(snapshot.value?.observations ?? []));
+const counts = computed(() => {
+  const out: Record<string, number> = {};
+  for (const o of snapshot.value?.observations ?? []) {
+    for (const [cat, types] of Object.entries(CATEGORIES)) {
+      if (types.includes(o.observation_type)) out[cat] = (out[cat] ?? 0) + 1;
+    }
+  }
+  return out;
+});
+
+// ------------------------------------------------------------- market understanding
 
 const state = ref<MarketState | null>(null);
 const stateError = ref<string>('');
@@ -180,14 +278,18 @@ const decisionTone = computed(() => {
 });
 
 onMounted(() => {
-  fetchCandles();
+  fetchObservations(true);
   fetchState();
-  timer = setInterval(fetchCandles, REFRESH_MS);
+  timer = setInterval(() => fetchObservations(false), REFRESH_MS);
   stateTimer = setInterval(fetchState, STATE_REFRESH_MS);
 });
 onUnmounted(() => {
   if (timer) clearInterval(timer);
   if (stateTimer) clearInterval(stateTimer);
+  chart?.remove();
+  chart = null;
+  series = null;
+  markers = null;
 });
 
 const primary = computed(() => {
@@ -218,38 +320,13 @@ function fmt(value: number | null | undefined, digits = 2) {
   return value === null || value === undefined ? '–' : value.toFixed(digits);
 }
 
-const lastPrice = computed(() => candles.value.at(-1)?.close);
+const lastPrice = computed(() => snapshot.value?.candles.at(-1)?.close);
 const change = computed(() => {
-  const first = candles.value[0]?.open;
+  const first = snapshot.value?.candles[0]?.open;
   const last = lastPrice.value;
   if (first === undefined || last === undefined) return undefined;
   return { abs: last - first, pct: ((last - first) / first) * 100 };
 });
-
-const chartOptions = computed(() => ({
-  animation: false,
-  tooltip: { trigger: 'axis', axisPointer: { type: 'cross' } },
-  grid: { left: '3%', right: '4%', top: '3%', bottom: 60, containLabel: true },
-  xAxis: { type: 'category', data: candles.value.map((_, i) => i), boundaryGap: true },
-  yAxis: { scale: true, splitLine: { show: true } },
-  dataZoom: [
-    { type: 'inside', start: 60, end: 100 },
-    { type: 'slider', start: 60, end: 100, bottom: 10 },
-  ],
-  series: [
-    {
-      type: 'candlestick',
-      name: 'XAUUSD',
-      data: candles.value.map((c) => [c.open, c.close, c.low, c.high]),
-      itemStyle: {
-        color: colorStore.colorUp,
-        color0: colorStore.colorDown,
-        borderColor: colorStore.colorUp,
-        borderColor0: colorStore.colorDown,
-      },
-    },
-  ],
-}));
 </script>
 
 <template>
@@ -257,7 +334,12 @@ const chartOptions = computed(() => ({
     <UCard class="flex-fill" :ui="{ body: 'p-3 sm:p-3 h-full' }">
       <div class="flex items-center gap-3 mb-2">
         <span class="text-xl font-bold">XAUUSD</span>
-        <span class="text-sm text-neutral-500">Gold &middot; 15m &middot; live from MT5</span>
+        <span class="text-sm text-neutral-500">
+          {{ snapshot?.symbol ?? 'Gold' }} &middot; {{ timeframe }} &middot; MT5
+          <span v-if="snapshot?.data_cutoff">
+            &middot; closed to {{ new Date(snapshot.data_cutoff).toLocaleTimeString() }}
+          </span>
+        </span>
         <span v-if="lastPrice !== undefined" class="ms-auto text-xl font-bold">
           {{ lastPrice.toFixed(2) }}
         </span>
@@ -271,11 +353,37 @@ const chartOptions = computed(() => ({
         </span>
       </div>
 
+      <div class="flex flex-wrap items-center gap-2 mb-2 text-xs">
+        <UButton
+          v-for="tf in TIMEFRAMES"
+          :key="tf"
+          size="xs"
+          :variant="tf === timeframe ? 'solid' : 'outline'"
+          @click="timeframe = tf"
+        >
+          {{ tf }}
+        </UButton>
+        <label v-for="(_, cat) in CATEGORIES" :key="cat" class="flex items-center gap-1 ms-2">
+          <input v-model="enabled[cat]" type="checkbox" />
+          {{ String(cat).replace(/_/g, ' ') }} ({{ counts[cat] ?? 0 }})
+        </label>
+      </div>
+
+      <div
+        v-if="snapshot && (snapshot.warnings.length || unknownTypes.length)"
+        class="text-xs text-amber-600 dark:text-amber-400 mb-1"
+      >
+        <span v-for="w in snapshot.warnings" :key="w" class="me-3">&#9888; {{ w }}</span>
+        <span v-if="unknownTypes.length">
+          &#9888; not drawn (no category): {{ unknownTypes.join(', ') }}
+        </span>
+      </div>
+
       <div
         v-if="error"
         class="border dark:border-neutral-700 border-neutral-300 rounded-md p-3 text-sm"
       >
-        Could not load gold candles: {{ error }}
+        Could not load the gold chart: {{ error }}
         <div v-if="blocked" class="text-neutral-500 mt-1">
           These routes require a bot login on this server. The chart stays blank rather than
           showing an empty candle series, because an empty series reads as a flat market.
@@ -288,13 +396,65 @@ const chartOptions = computed(() => ({
         </div>
       </div>
       <div v-else-if="loading" class="text-sm text-neutral-500 p-3">Loading candles&hellip;</div>
-      <ECharts
-        v-else
-        :option="chartOptions"
-        :theme="settingsStore.chartTheme"
-        autoresize
-        class="gold-chart"
-      />
+      <div v-show="!error && !loading" ref="chartEl" class="gold-chart" />
+
+      <div
+        v-if="selected"
+        class="mt-2 border dark:border-neutral-700 border-neutral-300 rounded-md p-2 text-xs grid md:grid-cols-4 gap-x-4 gap-y-1"
+      >
+        <div class="md:col-span-4 flex items-center gap-2">
+          <span class="font-bold">{{ selected.label }}</span>
+          <span class="text-neutral-500">
+            {{ selected.observation_type }} &middot; {{ selected.direction ?? 'no direction' }}
+          </span>
+          <span class="ms-auto font-mono text-neutral-500">{{ selected.observation_id }}</span>
+          <UButton size="xs" variant="ghost" @click="selected = null">close</UButton>
+        </div>
+        <div>
+          <span class="text-neutral-500">Price</span> {{ fmt(selected.lower_price) }}
+          <span v-if="selected.upper_price !== selected.lower_price">
+            &ndash; {{ fmt(selected.upper_price) }}
+          </span>
+        </div>
+        <div>
+          <span class="text-neutral-500">Status</span> {{ selected.status }}
+          <span v-if="selected.status_timestamp">
+            @ {{ new Date(selected.status_timestamp).toLocaleString() }}
+          </span>
+        </div>
+        <div>
+          <span class="text-neutral-500">Formed</span>
+          {{ new Date(selected.formation_timestamp).toLocaleString() }}
+        </div>
+        <div>
+          <span class="text-neutral-500">Knowable</span>
+          {{ new Date(selected.first_available_timestamp).toLocaleString() }}
+        </div>
+        <div><span class="text-neutral-500">Timeframe</span> {{ selected.source_timeframe }}</div>
+        <div class="md:col-span-2">
+          <span class="text-neutral-500">Detector</span>
+          {{ selected.detector_id }} &middot; {{ selected.detector_version }}
+        </div>
+        <div>
+          <span class="text-neutral-500">Quality</span> {{ selected.quality_status }}
+          <span v-if="(selected.detections ?? 1) > 1">
+            &middot; {{ selected.detections }} detections merged
+          </span>
+        </div>
+      </div>
+
+      <details v-if="snapshot" class="text-xs mt-1">
+        <summary class="cursor-pointer text-neutral-500">Not drawn, and why</summary>
+        <ul class="list-disc ms-4 text-neutral-500">
+          <li v-for="(why, name) in snapshot.unresolved" :key="name">
+            <b>{{ name }}</b>: {{ why }}
+          </li>
+        </ul>
+        <div class="text-neutral-500 mt-1">
+          Source {{ snapshot.source }} &middot; {{ snapshot.schema_version }} &middot;
+          {{ snapshot.engine_version }}
+        </div>
+      </details>
     </UCard>
 
     <UCard class="mt-2" :ui="{ body: 'p-3 sm:p-3' }">
@@ -505,7 +665,7 @@ const chartOptions = computed(() => ({
 .gold-chart {
   width: 100%;
   min-height: 360px;
-  /* Leaves room for the market-understanding panel below without scrolling the page. */
-  height: calc(100vh - 460px);
+  /* Leaves room for the controls and the market-understanding panel below. */
+  height: calc(100vh - 520px);
 }
 </style>

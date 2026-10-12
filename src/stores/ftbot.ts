@@ -1461,6 +1461,9 @@ export function createBotSubStore(botId: string, botName: string) {
     async function getGoldDecision() {
       return api<unknown>('/gold/decision');
     }
+    async function getGoldObservations(timeframe: string) {
+      return api<unknown>('/gold/observations', { query: { timeframe } });
+    }
     // #endregion gold
 
     return {
@@ -1468,6 +1471,7 @@ export function createBotSubStore(botId: string, botName: string) {
       getGoldCandles,
       getGoldMarketState,
       getGoldDecision,
+      getGoldObservations,
       isSelected,
       ping,
       botStatusAvailable,
