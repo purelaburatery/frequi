@@ -30,6 +30,18 @@ import {
   type Snapshot,
   type Zone,
 } from './goldOverlays';
+import {
+  DrawingsPrimitive,
+  TOOLS,
+  loadDrawings,
+  needsTwoPoints,
+  saveDrawings,
+  snap,
+  storageKey,
+  type Drawing,
+  type Point,
+  type Tool,
+} from './goldDrawings';
 
 interface TimeframeState {
   available: boolean;
@@ -84,7 +96,9 @@ const REFRESH_MS = 15000;
 // The engine's answer only moves when a candle closes, and the server caches it for 20s,
 // so polling faster than that would just re-fetch an identical response.
 const STATE_REFRESH_MS = 20000;
-const TIMEFRAMES = ['15m', '1h', '4h', '1d'];
+const TIMEFRAMES = ['1m', '3m', '5m', '15m', '1h', '4h', '1d'];
+const TF_SECONDS: Record<string, number> = { '1m': 60, '3m': 180, '5m': 300, '15m': 900, '1h': 3600, '4h': 14400, '1d': 86400 };
+const TF_LABEL: Record<string, string> = { '1d': 'D' };
 const PRIMARY_TF = '1h';
 
 const colorStore = useColorStore();
@@ -135,6 +149,41 @@ const enabled = ref<Record<string, boolean>>({ ...DEFAULT_ENABLED });
 // Default view shows the backend's small, relevant selection; history shows every stored
 // observation, including spent and hidden ones (CEO decision 2026-10-12).
 const history = ref(false);
+
+// ---- TradingView-style tools: the OWNER's drawings, kept in this browser only. They never
+// reach the backend and never mix with the bot's observations (goldDrawings.ts).
+const tool = ref<Tool>('cursor');
+const magnet = ref(true);
+const locked = ref(false);
+const hideDrawings = ref(false);
+const drawings = ref<Drawing[]>([]);
+const undoStack = ref<Drawing[][]>([]);
+let pending: Point | null = null;
+const drawingsPrimitive = new DrawingsPrimitive();
+
+// ---- favourites: categories pinned to the top bar, remembered per browser.
+const FAV_KEY = 'gold-favourite-categories';
+function readFavourites(): string[] {
+  try {
+    const raw = localStorage.getItem(FAV_KEY);
+    return raw ? JSON.parse(raw) : ['structure', 'liquidity', 'fvg'];
+  } catch {
+    return ['structure', 'liquidity', 'fvg'];
+  }
+}
+const favourites = ref<string[]>(readFavourites());
+function toggleFavourite(cat: string) {
+  favourites.value = favourites.value.includes(cat)
+    ? favourites.value.filter((c) => c !== cat)
+    : [...favourites.value, cat];
+  try {
+    localStorage.setItem(FAV_KEY, JSON.stringify(favourites.value));
+  } catch {
+    /* favourites last for this page only */
+  }
+}
+const indicatorsOpen = ref(false);
+const prettyCat = (c: string) => c.replace(/_/g, ' ');
 const selected = ref<Observation | null>(null);
 const error = ref<string>('');
 const loading = ref(true);
@@ -172,7 +221,9 @@ function buildChart() {
   });
   markers = createSeriesMarkers(series, []);
   series.attachPrimitive(zonesPrimitive);
+  series.attachPrimitive(drawingsPrimitive);
   chart.subscribeClick(onChartClick);
+  chart.subscribeCrosshairMove(onCrosshairMove);
 }
 
 /** Replace everything drawn - never append - so a refresh cannot duplicate a drawing. */
@@ -190,7 +241,96 @@ function render(fit = false) {
   if (fit) chart?.timeScale().fitContent();
 }
 
+function pointAt(param: MouseEventParams<Time>): Point | null {
+  if (!param.point || param.time === undefined || !series) return null;
+  const price = series.coordinateToPrice(param.point.y);
+  if (price === null) return null;
+  const time = param.time as number;
+  const bar = snapshot.value?.candles.find((c) => c.time === time);
+  return { time, price: magnet.value ? snap(price, bar) : price };
+}
+
+function commit(next: Drawing[]) {
+  undoStack.value = [...undoStack.value.slice(-49), drawings.value];
+  drawings.value = next;
+}
+
+function onCrosshairMove(param: MouseEventParams<Time>) {
+  if (!pending || tool.value === 'cursor') return;
+  const p = pointAt(param);
+  drawingsPrimitive.update({
+    preview: p ? { id: 'preview', tool: tool.value as Drawing['tool'], p1: pending, p2: p } : null,
+  });
+}
+
+function onDraw(param: MouseEventParams<Time>) {
+  if (locked.value) return;
+  const p = pointAt(param);
+  if (!p) return;
+  const t = tool.value as Drawing['tool'];
+  const id = `${t}:${Date.now()}`;
+  if (!needsTwoPoints(t)) {
+    if (t === 'text') {
+      const text = window.prompt('Text');
+      if (!text) return;
+      commit([...drawings.value, { id, tool: t, p1: p, text }]);
+    } else {
+      commit([...drawings.value, { id, tool: t, p1: p }]);
+    }
+    return;
+  }
+  if (!pending) {
+    pending = p;
+    return;
+  }
+  commit([...drawings.value, { id, tool: t, p1: pending, p2: p }]);
+  pending = null;
+  drawingsPrimitive.update({ preview: null });
+}
+
+function undo() {
+  const prev = undoStack.value.at(-1);
+  if (!prev) return;
+  undoStack.value = undoStack.value.slice(0, -1);
+  drawings.value = prev;
+}
+
+function clearDrawings() {
+  if (drawings.value.length) commit([]);
+}
+
+function onKey(e: KeyboardEvent) {
+  if (e.key === 'Escape') {
+    pending = null;
+    drawingsPrimitive.update({ preview: null });
+    tool.value = 'cursor';
+    indicatorsOpen.value = false;
+  } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') {
+    undo();
+  }
+}
+
+const drawKey = computed(() => storageKey(snapshot.value?.symbol ?? 'GOLD', timeframe.value));
+watch(drawKey, (key) => {
+  drawings.value = loadDrawings(key);
+  undoStack.value = [];
+});
+watch(drawings, (list) => {
+  saveDrawings(drawKey.value, list);
+  drawingsPrimitive.update({ drawings: list });
+}, { deep: true });
+watch(hideDrawings, (h) => drawingsPrimitive.update({ hidden: h }));
+watch(tool, () => {
+  pending = null;
+  drawingsPrimitive.update({ preview: null });
+});
+watch(timeframe, (tf) => drawingsPrimitive.update({ barSeconds: TF_SECONDS[tf] ?? 0 }), { immediate: true });
+
 function onChartClick(param: MouseEventParams<Time>) {
+  if (tool.value !== 'cursor') {
+    onDraw(param);
+    return;
+  }
   const obs = snapshot.value?.observations ?? [];
   if (param.hoveredObjectId) {
     selected.value = obs.find((o) => o.observation_id === param.hoveredObjectId) ?? null;
@@ -284,12 +424,14 @@ const decisionTone = computed(() => {
 });
 
 onMounted(() => {
+  window.addEventListener('keydown', onKey);
   fetchObservations(true);
   fetchState();
   timer = setInterval(() => fetchObservations(false), REFRESH_MS);
   stateTimer = setInterval(fetchState, STATE_REFRESH_MS);
 });
 onUnmounted(() => {
+  window.removeEventListener('keydown', onKey);
   if (timer) clearInterval(timer);
   if (stateTimer) clearInterval(stateTimer);
   chart?.remove();
@@ -337,135 +479,189 @@ const change = computed(() => {
 
 <template>
   <div class="flex flex-col h-full md:mx-3 mt-2 px-1">
-    <UCard class="flex-fill" :ui="{ body: 'p-3 sm:p-3 h-full' }">
-      <div class="flex items-center gap-3 mb-2">
-        <span class="text-xl font-bold">XAUUSD</span>
-        <span class="text-sm text-neutral-500">
-          {{ snapshot?.symbol ?? 'Gold' }} &middot; {{ timeframe }} &middot; MT5
-          <span v-if="snapshot?.data_cutoff">
-            &middot; closed to {{ new Date(snapshot.data_cutoff).toLocaleTimeString() }}
-          </span>
-        </span>
-        <span v-if="lastPrice !== undefined" class="ms-auto text-xl font-bold">
-          {{ lastPrice.toFixed(2) }}
-        </span>
-        <span
-          v-if="change"
-          class="text-sm font-semibold"
-          :style="{ color: change.abs >= 0 ? colorStore.colorUp : colorStore.colorDown }"
-        >
-          {{ change.abs >= 0 ? '+' : '' }}{{ change.abs.toFixed(2) }}
-          ({{ change.pct >= 0 ? '+' : '' }}{{ change.pct.toFixed(2) }}%)
-        </span>
-      </div>
-
-      <div class="flex flex-wrap items-center gap-2 mb-2 text-xs">
-        <UButton
+    <div class="tv-frame">
+      <!-- ============ top bar ============ -->
+      <div class="tv-top">
+        <span class="tv-symbol"><UIcon name="i-mdi-gold" />{{ snapshot?.symbol ?? 'XAUUSD' }}</span>
+        <span class="tv-sep" />
+        <button
           v-for="tf in TIMEFRAMES"
           :key="tf"
-          size="xs"
-          :variant="tf === timeframe ? 'solid' : 'outline'"
+          class="tv-btn"
+          :class="{ 'tv-on': tf === timeframe }"
           @click="timeframe = tf"
         >
-          {{ tf }}
-        </UButton>
-        <label class="flex items-center gap-1 ms-2 font-semibold">
-          <input v-model="history" type="checkbox" />
-          history (all {{ snapshot?.observations.length ?? 0 }})
-        </label>
-        <label v-for="(_, cat) in CATEGORIES" :key="cat" class="flex items-center gap-1 ms-2">
-          <input v-model="enabled[cat]" type="checkbox" />
-          {{ String(cat).replace(/_/g, ' ') }} ({{ counts[cat] ?? 0 }})
-        </label>
-      </div>
-
-      <div
-        v-if="snapshot && (snapshot.warnings.length || unknownTypes.length)"
-        class="text-xs text-amber-600 dark:text-amber-400 mb-1"
-      >
-        <span v-for="w in snapshot.warnings" :key="w" class="me-3">&#9888; {{ w }}</span>
-        <span v-if="unknownTypes.length">
-          &#9888; not drawn (no category): {{ unknownTypes.join(', ') }}
+          {{ TF_LABEL[tf] ?? tf }}
+        </button>
+        <span class="tv-sep" />
+        <div class="relative">
+          <button class="tv-btn tv-wide" :class="{ 'tv-on': indicatorsOpen }" @click="indicatorsOpen = !indicatorsOpen">
+            <UIcon name="i-mdi-chart-box-outline" /> Indicators <UIcon name="i-mdi-chevron-down" />
+          </button>
+          <div v-if="indicatorsOpen" class="tv-menu">
+            <div class="tv-menu-head">Bot observations</div>
+            <div v-for="(_, cat) in CATEGORIES" :key="cat" class="tv-menu-row">
+              <label class="flex items-center gap-2 grow cursor-pointer">
+                <input v-model="enabled[cat]" type="checkbox" />
+                <span class="capitalize">{{ prettyCat(String(cat)) }}</span>
+                <span class="tv-count">{{ counts[cat] ?? 0 }}</span>
+              </label>
+              <button class="tv-icon" :title="favourites.includes(String(cat)) ? 'Unpin from top bar' : 'Pin to top bar'" @click="toggleFavourite(String(cat))">
+                <UIcon :name="favourites.includes(String(cat)) ? 'i-mdi-star' : 'i-mdi-star-outline'" />
+              </button>
+            </div>
+            <div class="tv-menu-row">
+              <label class="flex items-center gap-2 grow cursor-pointer">
+                <input v-model="history" type="checkbox" /> History (all {{ snapshot?.observations.length ?? 0 }})
+              </label>
+            </div>
+          </div>
+        </div>
+        <button
+          v-for="cat in favourites"
+          :key="'fav-' + cat"
+          class="tv-btn tv-chip capitalize"
+          :class="{ 'tv-on': enabled[cat] }"
+          :title="'Toggle ' + prettyCat(cat)"
+          @click="enabled[cat] = !enabled[cat]"
+        >
+          <UIcon name="i-mdi-star" class="tv-star" /> {{ prettyCat(cat) }}
+        </button>
+        <button class="tv-btn" :class="{ 'tv-on': history }" title="Show every stored observation" @click="history = !history">
+          <UIcon name="i-mdi-history" />
+        </button>
+        <button class="tv-btn" title="Undo (Ctrl+Z)" :disabled="!undoStack.length" @click="undo"><UIcon name="i-mdi-undo" /></button>
+        <button class="tv-btn" title="Refresh" @click="fetchObservations(false)"><UIcon name="i-mdi-refresh" /></button>
+        <span class="ms-auto flex items-center gap-2">
+          <span v-if="snapshot?.data_cutoff" class="tv-muted">closed {{ new Date(snapshot.data_cutoff).toLocaleTimeString() }}</span>
+          <span v-if="lastPrice !== undefined" class="font-bold">{{ lastPrice.toFixed(2) }}</span>
+          <span
+            v-if="change"
+            class="font-semibold"
+            :style="{ color: change.abs >= 0 ? colorStore.colorUp : colorStore.colorDown }"
+          >
+            {{ change.abs >= 0 ? '+' : '' }}{{ change.abs.toFixed(2) }} ({{ change.pct >= 0 ? '+' : '' }}{{ change.pct.toFixed(2) }}%)
+          </span>
         </span>
       </div>
 
-      <div
-        v-if="error"
-        class="border dark:border-neutral-700 border-neutral-300 rounded-md p-3 text-sm"
-      >
-        Could not load the gold chart: {{ error }}
-        <div v-if="blocked" class="text-neutral-500 mt-1">
-          These routes require a bot login on this server. The chart stays blank rather than
-          showing an empty candle series, because an empty series reads as a flat market.
+      <div class="tv-body">
+        <!-- ============ left toolbar ============ -->
+        <div class="tv-left">
+          <button
+            v-for="t in TOOLS"
+            :key="t.id"
+            class="tv-tool"
+            :class="{ 'tv-on': tool === t.id }"
+            :title="t.label"
+            @click="tool = t.id"
+          >
+            <UIcon :name="t.icon" />
+          </button>
+          <span class="tv-hsep" />
+          <button class="tv-tool" :class="{ 'tv-on': magnet }" title="Magnet: snap to open/high/low/close" @click="magnet = !magnet">
+            <UIcon name="i-mdi-magnet" />
+          </button>
+          <button class="tv-tool" :class="{ 'tv-on': locked }" title="Lock drawings" @click="locked = !locked">
+            <UIcon :name="locked ? 'i-mdi-lock' : 'i-mdi-lock-open-variant-outline'" />
+          </button>
+          <button class="tv-tool" :class="{ 'tv-on': hideDrawings }" title="Hide my drawings" @click="hideDrawings = !hideDrawings">
+            <UIcon :name="hideDrawings ? 'i-mdi-eye-off-outline' : 'i-mdi-eye-outline'" />
+          </button>
+          <button class="tv-tool" title="Remove all my drawings (Ctrl+Z undoes)" @click="clearDrawings">
+            <UIcon name="i-mdi-delete-outline" />
+          </button>
+          <span class="grow" />
+          <button class="tv-tool" :class="{ 'tv-on': indicatorsOpen }" title="Favourites" @click="indicatorsOpen = !indicatorsOpen">
+            <UIcon name="i-mdi-star-outline" />
+          </button>
         </div>
-        <div v-else-if="error.startsWith('Not authorised')" class="text-neutral-500 mt-1">
-          Log in to the bot again from the Bots page, then reload.
-        </div>
-        <div v-else class="text-neutral-500 mt-1">
-          Check that the MT5 terminal is running and logged into a trade account.
+
+        <!-- ============ chart ============ -->
+        <div class="tv-chart-wrap">
+          <div
+            v-if="snapshot && (snapshot.warnings.length || unknownTypes.length)"
+            class="tv-warn"
+          >
+            <span v-for="w in snapshot.warnings" :key="w" class="me-3">&#9888; {{ w }}</span>
+            <span v-if="unknownTypes.length">&#9888; not drawn (no category): {{ unknownTypes.join(', ') }}</span>
+          </div>
+          <div v-if="error" class="p-3 text-sm">
+            Could not load the gold chart: {{ error }}
+            <div v-if="blocked" class="tv-muted mt-1">
+              These routes require a bot login on this server. The chart stays blank rather than
+              showing an empty candle series, because an empty series reads as a flat market.
+            </div>
+            <div v-else-if="error.startsWith('Not authorised')" class="tv-muted mt-1">
+              Log in to the bot again from the Bots page, then reload.
+            </div>
+            <div v-else class="tv-muted mt-1">
+              Check that the MT5 terminal is running and logged into a trade account.
+            </div>
+          </div>
+          <div v-else-if="loading" class="p-3 text-sm tv-muted">Loading candles&hellip;</div>
+          <div v-show="!error && !loading" ref="chartEl" class="gold-chart" :class="{ 'tv-drawing': tool !== 'cursor' }" />
         </div>
       </div>
-      <div v-else-if="loading" class="text-sm text-neutral-500 p-3">Loading candles&hellip;</div>
-      <div v-show="!error && !loading" ref="chartEl" class="gold-chart" />
+    </div>
 
-      <div
-        v-if="selected"
-        class="mt-2 border dark:border-neutral-700 border-neutral-300 rounded-md p-2 text-xs grid md:grid-cols-4 gap-x-4 gap-y-1"
-      >
-        <div class="md:col-span-4 flex items-center gap-2">
-          <span class="font-bold">{{ selected.label }}</span>
-          <span class="text-neutral-500">
-            {{ selected.observation_type }} &middot; {{ selected.direction ?? 'no direction' }}
-          </span>
-          <span class="ms-auto font-mono text-neutral-500">{{ selected.observation_id }}</span>
-          <UButton size="xs" variant="ghost" @click="selected = null">close</UButton>
-        </div>
-        <div>
-          <span class="text-neutral-500">Price</span> {{ fmt(selected.lower_price) }}
-          <span v-if="selected.upper_price !== selected.lower_price">
-            &ndash; {{ fmt(selected.upper_price) }}
-          </span>
-        </div>
-        <div>
-          <span class="text-neutral-500">Status</span> {{ selected.status }}
-          <span v-if="selected.status_timestamp">
-            @ {{ new Date(selected.status_timestamp).toLocaleString() }}
-          </span>
-        </div>
-        <div>
-          <span class="text-neutral-500">Formed</span>
-          {{ new Date(selected.formation_timestamp).toLocaleString() }}
-        </div>
-        <div>
-          <span class="text-neutral-500">Knowable</span>
-          {{ new Date(selected.first_available_timestamp).toLocaleString() }}
-        </div>
-        <div><span class="text-neutral-500">Timeframe</span> {{ selected.source_timeframe }}</div>
-        <div class="md:col-span-2">
-          <span class="text-neutral-500">Detector</span>
-          {{ selected.detector_id }} &middot; {{ selected.detector_version }}
-        </div>
-        <div>
-          <span class="text-neutral-500">Quality</span> {{ selected.quality_status }}
-          <span v-if="(selected.detections ?? 1) > 1">
-            &middot; {{ selected.detections }} detections merged
-          </span>
-        </div>
+    <div
+      v-if="selected"
+      class="mt-2 border dark:border-neutral-700 border-neutral-300 rounded-md p-2 text-xs grid md:grid-cols-4 gap-x-4 gap-y-1"
+    >
+      <div class="md:col-span-4 flex items-center gap-2">
+        <span class="font-bold">{{ selected.label }}</span>
+        <span class="text-neutral-500">
+          {{ selected.observation_type }} &middot; {{ selected.direction ?? 'no direction' }}
+        </span>
+        <span class="ms-auto font-mono text-neutral-500">{{ selected.observation_id }}</span>
+        <UButton size="xs" variant="ghost" @click="selected = null">close</UButton>
       </div>
+      <div>
+        <span class="text-neutral-500">Price</span> {{ fmt(selected.lower_price) }}
+        <span v-if="selected.upper_price !== selected.lower_price">
+          &ndash; {{ fmt(selected.upper_price) }}
+        </span>
+      </div>
+      <div>
+        <span class="text-neutral-500">Status</span> {{ selected.status }}
+        <span v-if="selected.status_timestamp">
+          @ {{ new Date(selected.status_timestamp).toLocaleString() }}
+        </span>
+      </div>
+      <div>
+        <span class="text-neutral-500">Formed</span>
+        {{ new Date(selected.formation_timestamp).toLocaleString() }}
+      </div>
+      <div>
+        <span class="text-neutral-500">Knowable</span>
+        {{ new Date(selected.first_available_timestamp).toLocaleString() }}
+      </div>
+      <div><span class="text-neutral-500">Timeframe</span> {{ selected.source_timeframe }}</div>
+      <div class="md:col-span-2">
+        <span class="text-neutral-500">Detector</span>
+        {{ selected.detector_id }} &middot; {{ selected.detector_version }}
+      </div>
+      <div>
+        <span class="text-neutral-500">Quality</span> {{ selected.quality_status }}
+        <span v-if="(selected.detections ?? 1) > 1">
+          &middot; {{ selected.detections }} detections merged
+        </span>
+      </div>
+    </div>
 
-      <details v-if="snapshot" class="text-xs mt-1">
-        <summary class="cursor-pointer text-neutral-500">Not drawn, and why</summary>
-        <ul class="list-disc ms-4 text-neutral-500">
-          <li v-for="(why, name) in snapshot.unresolved" :key="name">
-            <b>{{ name }}</b>: {{ why }}
-          </li>
-        </ul>
-        <div class="text-neutral-500 mt-1">
-          Source {{ snapshot.source }} &middot; {{ snapshot.schema_version }} &middot;
-          {{ snapshot.engine_version }}
-        </div>
-      </details>
-    </UCard>
+    <details v-if="snapshot" class="text-xs mt-1">
+      <summary class="cursor-pointer text-neutral-500">Not drawn, and why</summary>
+      <ul class="list-disc ms-4 text-neutral-500">
+        <li v-for="(why, name) in snapshot.unresolved" :key="name">
+          <b>{{ name }}</b>: {{ why }}
+        </li>
+      </ul>
+      <div class="text-neutral-500 mt-1">
+        Source {{ snapshot.source }} &middot; {{ snapshot.schema_version }} &middot;
+        {{ snapshot.engine_version }}
+      </div>
+    </details>
 
     <UCard class="mt-2" :ui="{ body: 'p-3 sm:p-3' }">
       <div class="flex flex-wrap items-baseline gap-3 mb-2">
@@ -672,10 +868,152 @@ const change = computed(() => {
 </template>
 
 <style scoped>
+.tv-frame {
+  border: 1px solid #2a2e39;
+  border-radius: 4px;
+  background: #131722;
+  color: #d1d4dc;
+  font-size: 12px;
+  overflow: visible;
+}
+.tv-top {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  height: 38px;
+  padding: 0 6px;
+  border-bottom: 1px solid #2a2e39;
+  flex-wrap: nowrap;
+  overflow-x: auto;
+}
+.tv-symbol {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 10px;
+  border-radius: 14px;
+  background: #1e222d;
+  font-weight: 700;
+}
+.tv-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  height: 28px;
+  min-width: 28px;
+  padding: 0 6px;
+  border-radius: 4px;
+  color: #d1d4dc;
+  white-space: nowrap;
+}
+.tv-btn:hover:not(:disabled),
+.tv-tool:hover,
+.tv-icon:hover {
+  background: #2a2e39;
+}
+.tv-btn:disabled {
+  opacity: 0.35;
+}
+.tv-on {
+  background: #2a2e39;
+  color: #2962ff;
+}
+.tv-chip {
+  font-size: 11px;
+}
+.tv-star {
+  color: #f7c948;
+}
+.tv-sep {
+  width: 1px;
+  height: 20px;
+  margin: 0 4px;
+  background: #2a2e39;
+}
+.tv-menu {
+  position: absolute;
+  top: 32px;
+  left: 0;
+  z-index: 50;
+  width: 260px;
+  padding: 4px 0;
+  border: 1px solid #2a2e39;
+  border-radius: 6px;
+  background: #1e222d;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+}
+.tv-menu-head {
+  padding: 6px 12px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: #787b86;
+}
+.tv-menu-row {
+  display: flex;
+  align-items: center;
+  padding: 5px 12px;
+}
+.tv-menu-row:hover {
+  background: #2a2e39;
+}
+.tv-count {
+  margin-left: auto;
+  color: #787b86;
+}
+.tv-icon {
+  margin-left: 8px;
+  padding: 2px;
+  border-radius: 3px;
+  color: #f7c948;
+}
+.tv-body {
+  display: flex;
+}
+.tv-left {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  width: 42px;
+  padding: 6px 0;
+  border-right: 1px solid #2a2e39;
+}
+.tv-tool {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border-radius: 4px;
+  font-size: 18px;
+  color: #d1d4dc;
+}
+.tv-hsep {
+  width: 24px;
+  height: 1px;
+  margin: 4px 0;
+  background: #2a2e39;
+}
+.tv-chart-wrap {
+  flex: 1;
+  min-width: 0;
+}
+.tv-warn {
+  padding: 2px 8px;
+  font-size: 11px;
+  color: #f7a600;
+}
+.tv-muted {
+  color: #787b86;
+}
+.tv-drawing {
+  cursor: crosshair;
+}
 .gold-chart {
   width: 100%;
-  min-height: 360px;
-  /* Leaves room for the controls and the market-understanding panel below. */
-  height: calc(100vh - 520px);
+  min-height: 380px;
+  /* Leaves room for the market-understanding panel below. */
+  height: calc(100vh - 430px);
 }
 </style>
