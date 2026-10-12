@@ -21,6 +21,7 @@ import {
   CATEGORIES,
   DEFAULT_ENABLED,
   ZonesPrimitive,
+  inView,
   toMarkers,
   toZones,
   uncategorised,
@@ -131,6 +132,9 @@ function describe(e: unknown): string {
 const snapshot = ref<Snapshot | null>(null);
 const timeframe = ref('15m');
 const enabled = ref<Record<string, boolean>>({ ...DEFAULT_ENABLED });
+// Default view shows the backend's small, relevant selection; history shows every stored
+// observation, including spent and hidden ones (CEO decision 2026-10-12).
+const history = ref(false);
 const selected = ref<Observation | null>(null);
 const error = ref<string>('');
 const loading = ref(true);
@@ -179,8 +183,9 @@ function render(fit = false) {
     s.candles.map((c) => ({ time: c.time as Time, open: c.open, high: c.high, low: c.low, close: c.close })),
   );
   const lastTime = s.candles.at(-1)?.time ?? 0;
-  markers.setMarkers(toMarkers(s.observations, enabled.value));
-  drawnZones = toZones(s.observations, enabled.value, lastTime);
+  const drawn = inView(s, history.value);
+  markers.setMarkers(toMarkers(drawn, enabled.value));
+  drawnZones = toZones(drawn, enabled.value, lastTime);
   zonesPrimitive.setZones(drawnZones);
   if (fit) chart?.timeScale().fitContent();
 }
@@ -225,6 +230,7 @@ watch(timeframe, () => {
   fetchObservations(true);
 });
 watch(enabled, () => render(), { deep: true });
+watch(history, () => render());
 
 const unknownTypes = computed(() => uncategorised(snapshot.value?.observations ?? []));
 const counts = computed(() => {
@@ -363,6 +369,10 @@ const change = computed(() => {
         >
           {{ tf }}
         </UButton>
+        <label class="flex items-center gap-1 ms-2 font-semibold">
+          <input v-model="history" type="checkbox" />
+          history (all {{ snapshot?.observations.length ?? 0 }})
+        </label>
         <label v-for="(_, cat) in CATEGORIES" :key="cat" class="flex items-center gap-1 ms-2">
           <input v-model="enabled[cat]" type="checkbox" />
           {{ String(cat).replace(/_/g, ' ') }} ({{ counts[cat] ?? 0 }})

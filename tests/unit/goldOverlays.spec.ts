@@ -6,6 +6,8 @@ import {
   DEFAULT_ENABLED,
   ZonesPrimitive,
   categoryOf,
+  inView,
+  type Snapshot,
   toMarkers,
   toZones,
   uncategorised,
@@ -96,6 +98,19 @@ describe('goldOverlays', () => {
     p.setZones(zones);
     p.setZones(zones);
     expect(p.zones).toHaveLength(1);
+  });
+
+  it('draws only the selected ids by default, everything in history, and edits nothing', () => {
+    const all = ['s1', 's2', 'z1', 'z2', 'z3', 'z4'].map((id) => obs({ observation_id: id }));
+    const snap = {
+      observations: all,
+      display: { rules: 'chart_display/1.0', swings: ['s1'], liquidity: [], always: [],
+        zones: { fvg: ['z1', 'z2', 'z3'] } },
+    } as unknown as Snapshot;
+    const before = JSON.stringify(all);
+    expect(inView(snap, false).map((o) => o.observation_id)).toEqual(['s1', 'z1', 'z2', 'z3']);
+    expect(inView(snap, true)).toHaveLength(6);
+    expect(JSON.stringify(all)).toBe(before);
   });
 
   it('every backend kind has a category and a default', () => {

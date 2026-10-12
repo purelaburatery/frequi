@@ -59,6 +59,28 @@ export interface Snapshot {
   unresolved: Record<string, string>;
   warnings: string[];
   engine_version: string;
+  display?: Display;
+}
+
+/** Backend's choice of what the default view draws (chart_display/1.0). */
+export interface Display {
+  rules: string;
+  swings: string[];
+  liquidity: string[];
+  zones: Record<string, string[]>;
+  always: string[];
+}
+
+/**
+ * What to draw. Default: only the ids the backend selected (3 swings, 1 liquidity level per
+ * side, 3 zones per category). History: every observation. Either way the observation list
+ * itself is untouched - this filters, it never edits or drops data.
+ */
+export function inView(snapshot: Snapshot, history: boolean): Observation[] {
+  if (history || !snapshot.display) return snapshot.observations;
+  const d = snapshot.display;
+  const ids = new Set([...d.swings, ...d.liquidity, ...d.always, ...Object.values(d.zones).flat()]);
+  return snapshot.observations.filter((o) => ids.has(o.observation_id));
 }
 
 /** Toggle groups. A type the backend sends but no group names is reported, never hidden. */
